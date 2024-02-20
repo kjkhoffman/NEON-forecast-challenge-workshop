@@ -179,7 +179,7 @@ forecast_df_EFI <- forecast_df %>%
 
 ```
 
-```{r write-forecast}
+```{r write-forecast, echo=TRUE}
 # Write the forecast to file
 theme <- 'aquatics'
 date <- forecast_df_EFI$reference_datetime[1]
@@ -203,13 +203,13 @@ neon4cast::forecast_output_validator(file.path('Forecasts',forecast_file_1))
 
 Change eval = TRUE if you want to submit
 
-```{r submit-forecast, eval=TRUE}
+```{r, label=submit-forecast, eval=TRUE, echo=TRUE}
 
 neon4cast::submit(forecast_file = file.path('Forecasts', forecast_file_1), ask = F) # if ask = T (default), it will produce a pop-up box asking if you want to submit
 
 ```
 
-```{r plot-forecast}
+```{r plot-forecast, echo=TRUE}
 forecast_df_EFI |> 
   ggplot(aes(x=datetime, y=prediction, group = parameter)) +
   geom_line() +
