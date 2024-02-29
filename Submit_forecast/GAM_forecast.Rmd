@@ -1,0 +1,341 @@
+---
+title: "KKH_forecast_realattempt"
+author: "KKH"
+date: "2024-02-29"
+output: html_document
+---
+
+WILL NEED TO INSTALL TIDYMODELS AND THE MGCV PACKAGE IN DOCKER!!!
+- DONE
+
+GO TO GITHUB, CLICK ON DRAFT PDF YML AND DELETE IT!!!
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load-packages, echo = F, warning=F, message=F}
+## install.packages('remotes')
+## install.packages('fpp3') # package for applying simple forecasting methods
+## install.packages('tsibble') # package for dealing with time series data sets and tsibble objects
+## install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
+## install.packages('lubridate') # working with dates and times
+## remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
+install.packages("tidymodels")
+install.packages("mgcv")
+install.packages("reshape2")
+install.packages("lubridate")
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+library(mgcv)
+library(reshape2)
+library(ggplot2)
+```
+
+```{r get-targets, message=F}
+#read in the targets data
+targets <- read_csv('https://data.ecoforecast.org/neon4cast-targets/aquatics/aquatics-targets.csv.gz')
+
+# read in the sites data
+aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-targets/main/NEON_Field_Site_Metadata_20220412.csv") |>
+  dplyr::filter(aquatics == 1)
+
+lake_sites <- aquatic_sites %>%
+  filter(field_site_subtype == 'Lake')
+
+url <- "https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/supporting_data/project_id=neon4cast/aquatics-expanded-observations.csv.gz"
+
+lake_depths <- read_csv(url, show_col_types = FALSE)
+
+# Filter the targets
+targets <- targets %>%
+  filter(site_id %in% lake_sites$field_site_id,
+         variable == 'temperature')
+```
+
+This is where you could change or add meteorological variables that are used to predict the target
+
+Other variable names can be found at <https://projects.ecoforecast.org/neon4cast-docs/Shared-Forecast-Drivers.html#stage-3>
+
+Variable names:
+air_temperature (K)
+air_pressure (Pa)
+relative_humidity (proportion)
+surface_downwelling_longwave_flux_in_air (W/m^2)
+surface_downwelling_shortwave_flux_in_air (W/m^2) 
+precipitation_flux (kg/(m^2 s))
+eastward_wind (m/s)
+northward_wind (m/s)
+
+```{r}
+met_variables <- c("air_temperature", "precipitation_flux", "eastward_wind", "northward_wind", "air_pressure")
+# variables <- c("air_temperature", "precipitation_flux")
+```
+
+Get NOAA past forecasts for model building and testing. Past forecasts are available starting 2020-09-24
+```{r get-NOAA-past, message = F}
+
+# Past stacked weather
+noaa_past_s3 <- neon4cast::noaa_stage3()
+
+noaa_past <- noaa_past_s3  |> 
+  dplyr::filter(site_id %in% lake_sites$field_site_id,
+                datetime >= ymd('2017-01-01'),
+                variable %in% met_variables) |> 
+  dplyr::collect()
+
+# aggregate the past to mean values
+noaa_past_mean <- noaa_past |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  # convert air temperature to Celsius if it is included in the weather data
+  mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+  pivot_wider(names_from = variable, values_from = prediction)
+```
+
+Let's look at some variables and consider some correlations. 
+NOAA data
+
+```{r variable correlations}
+noaa_past_mean_cor <- noaa_past_mean[, c(3,4,5,6,7)]
+cor_matrix <- round(cor(noaa_past_mean_cor), 2)
+head(cor_matrix)
+melted_cor_matrix <- melt(cor_matrix)
+head(melted_cor_matrix)
+
+ggplot(data = melted_cor_matrix, aes(x=Var1, y=Var2, fill=value)) + 
+  geom_tile()
+```
+
+Considering different model types! 
+Non-parametric statistical models: splines, GAMs and Gaussian process regression, others?
+Autoregressive with up to ? day lags
+
+Start by making an autoregressive model for temperature similar to mod 7
+
+```{r library tidymodels}
+#install.packages("tidymodels")
+library(tidymodels)
+tidymodels_prefer()
+set.seed(100)
+```
+
+I'm going to train my models only on Suggs and Barco because that is what we have data available for. I will then apply those best models to all of the sites.
+
+```{r play with tidymodels}
+unique(targets$site_id) #targets contains all of the sites! great
+dev_sites <- c("BARC", "SUGG")
+
+#filter to just BARC and SUGG
+moddev_targets <- targets %>% 
+  filter(site_id %in% dev_sites)
+unique(moddev_targets$site_id) #double check!
+
+moddev_noaa <- noaa_past_mean %>% 
+  filter(site_id %in% dev_sites)
+unique(moddev_noaa$site_id) #double check
+```
+
+```{r join noaa and targets}
+moddev_targets_df <- moddev_targets |> 
+  filter(variable == 'temperature') |>
+  pivot_wider(names_from = 'variable', values_from = 'observation') |> 
+  left_join(moddev_noaa, 
+            by = c("datetime","site_id")) |> 
+  mutate(doy = yday(datetime))
+```
+
+```{r}
+moddev_targets_df_naomit <- na.omit(moddev_targets_df)
+```
+
+
+```{r training and testing data}
+#split your data into testing and training data
+split <- initial_split(moddev_targets_df_naomit, prop = 0.75, strata = site_id)
+split
+
+#create training dataset
+train_data <- training(split)
+train_data
+
+#create testing dataset
+test_data <- testing(split)
+test_data
+```
+
+```{r look at some data and relationships}
+# Load mgcv
+library(mgcv)
+
+#create the formula for the gam
+gam_formula <- temperature ~ air_temperature + eastward_wind + northward_wind
+gam_formula
+#create the formula for the smoothing function
+s_model <- temperature ~ air_temperature + s(eastward_wind, k=10) + s(northward_wind, k = 10)
+
+#rerun the training data (awas having issues)
+train_data <- training(split)
+
+#make the gam model in tidymodels
+gam_model <-
+  gen_additive_mod() %>%
+  set_engine("mgcv") %>%
+  set_mode("regression")
+
+#create a recipe
+recipe <- train_data |> 
+   recipe(gam_formula) #|> 
+  # step_rm(datetime) |>
+  # step_naomit(air_temperature, temperature)
+
+#create a workflow
+wflow <-
+  workflow() |> 
+  add_model(gam_model, formula = s_model) |> 
+  add_recipe(recipe) 
+wflow  
+
+#create an output with the fit of the data based on training
+fit <- wflow |> 
+  fit(data = train_data)
+
+#fit output
+fit 
+```
+
+Make new predictions
+```{r predictions}
+predictions <- predict(fit, new_data = test_data)
+pred_test <- bind_cols(test_data, predictions)
+pred_test
+
+multi_metric <- metric_set(rmse, rsq)
+
+metric_table <- pred_test |> 
+  multi_metric(truth = temperature, estimate = .pred)
+
+metric_table
+```
+
+read in the NOAA future new data
+```{r future NOAA}
+# Future weather
+# New forecast only available at 5am UTC the next day
+forecast_date <- Sys.Date() 
+noaa_date <- forecast_date - days(1)
+
+noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
+
+noaa_future <- noaa_future_s3 |> 
+  dplyr::filter(datetime >= forecast_date,
+                site_id %in% lake_sites$field_site_id,
+                variable %in% met_variables) |> 
+  collect()
+
+noaa_future_daily <- noaa_future |> 
+  mutate(datetime = as_date(datetime)) |> 
+  # mean daily forecasts at each site per ensemble
+  group_by(datetime, site_id, parameter, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  # convert air temperature to Celsius if it is included in the weather data
+  mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+  pivot_wider(names_from = variable, values_from = prediction) |> 
+  select(any_of(c('datetime', 'site_id', met_variables, 'parameter')))
+```
+
+```{r model-setup}
+# Generate a dataframe to fit the model from 
+#was targets_lm
+targets_gam <- targets |> 
+  pivot_wider(names_from = 'variable', values_from = 'observation') |> 
+  left_join(noaa_past_mean, 
+            by = c("datetime","site_id"))
+
+# Loop through each site and datetime to fit the model
+forecast_df <- NULL
+```
+
+```{r predict test data}
+targets_future <- noaa_future_daily |> 
+  mutate(temperature = NA,
+         doy = yday(datetime)) |> 
+  filter(parameter == 1) |> 
+  select(-parameter)
+
+targets_future
+
+targets_future <- noaa_future_daily |> 
+  mutate(temperature = NA,
+         doy = yday(datetime))
+
+tidymodels_forecast <- data.frame()
+
+for(i in unique(targets_future$parameter)){
+  curr_ens <- targets_future |> 
+    filter(parameter == i) |> 
+    select(-parameter)
+  
+  new_predictions <- predict(fit, new_data = curr_ens)
+  curr_ens <- bind_cols(curr_ens, new_predictions) |> 
+    mutate(parameter = i)
+  tidymodels_forecast <- bind_rows(tidymodels_forecast, curr_ens)
+}
+
+tidymodels_forecasts_EFI <- tidymodels_forecast %>%
+  rename(prediction = .pred) %>%
+  mutate(variable = "temperature") |> 
+  # For the EFI challenge we only want the forecast for future
+  filter(datetime > Sys.Date()) %>%
+  group_by(site_id, variable) %>%
+  mutate(reference_datetime = min(datetime) - lubridate::days(1),
+         family = "ensemble",
+         model_id = "GAM_air_wind") %>%
+  select(model_id, datetime, reference_datetime, site_id, family, parameter, variable, prediction)
+
+tidymodels_forecasts_EFI |>
+  filter(variable == "temperature") |>
+  ggplot(aes(x = datetime, y = prediction, group = parameter)) +
+  geom_line() + 
+  facet_wrap(~site_id)
+```
+
+```{r write-forecast, echo=TRUE}
+# Write the forecast to file
+theme <- 'aquatics'
+date <- tidymodels_forecasts_EFI$reference_datetime[1]
+forecast_name_1 <- paste0(tidymodels_forecasts_EFI$model_id[1], ".csv")
+forecast_file_1 <- paste(theme, date, forecast_name_1, sep = '-')
+forecast_file_1
+
+
+if (!dir.exists('Forecasts')) {
+  dir.create('Forecasts')
+}
+
+write_csv(tidymodels_forecasts_EFI, file.path('Forecasts',forecast_file_1))
+```
+
+```{r}
+neon4cast::forecast_output_validator(file.path('Forecasts',forecast_file_1))
+```
+
+Change eval = TRUE if you want to submit
+
+```{r, label=submit-forecast, eval=TRUE, echo=TRUE}
+
+neon4cast::submit(forecast_file = file.path('Forecasts', forecast_file_1), ask = F) # if ask = T (default), it will produce a pop-up box asking if you want to submit
+
+```
+
+```{r plot-forecast, echo=TRUE}
+tidymodels_forecasts_EFI |> 
+  ggplot(aes(x=datetime, y=prediction, group = parameter)) +
+  geom_line() +
+  facet_wrap(~site_id) +
+  labs(title = paste0('Forecast generated for ', tidymodels_forecasts_EFI$variable[1], ' on ', tidymodels_forecasts_EFI$reference_datetime[1]))
+```
